@@ -8,9 +8,14 @@ import {z} from 'zod'
 
 const LOGSEQ_TOKEN = process.env.LOGSEQ_TOKEN
 
-const LOGSEQ_HOST = process.env.LOGSEQ_HOST ?? '127.0.0.1'
+const LOGSEQ_HOST = process.env.LOGSEQ_HOST ?? '172.31.96.1'
 const LOGSEQ_PORT = process.env.LOGSEQ_PORT ?? '12315'
-const LOGSEQ_API_URL = process.env.LOGSEQ_API_URL ?? `http://${LOGSEQ_HOST}:${LOGSEQ_PORT}/api`
+// IMPORTANT: Always ensure /api suffix is present
+let LOGSEQ_API_URL = process.env.LOGSEQ_API_URL ?? `http://${LOGSEQ_HOST}:${LOGSEQ_PORT}/api`
+// Fix missing /api suffix if present
+if (LOGSEQ_API_URL && !LOGSEQ_API_URL.endsWith('/api')) {
+    LOGSEQ_API_URL = `${LOGSEQ_API_URL}/api`
+}
 
 const server = new McpServer({
     name: 'Logseq Tools',
@@ -21,31 +26,21 @@ const server = new McpServer({
 const PAGE_LINK_REGEX = /\[\[(.*?)\]\]/g
 
 // Format a date as a string in the format that Logseq journal pages use
+// Logseq format: "weekday, DD.MM.YYYY" (all lowercase)
+// Example: "saturday, 14.02.2026"
 function formatJournalDate(date: Date): string {
-    const month = date.toLocaleString('en-US', {month: 'short'}).toLowerCase()
-    const day = date.getDate()
+    const weekday = date.toLocaleString('en-US', {weekday: 'long'}).toLowerCase()
+    const day = String(date.getDate()).padStart(2, '0')
+    const month = String(date.getMonth() + 1).padStart(2, '0')
     const year = date.getFullYear()
-    return `${month} ${day}${getDaySuffix(day)}, ${year}`
-}
-
-// Get the appropriate suffix for a day number (1st, 2nd, 3rd, etc.)
-function getDaySuffix(day: number): string {
-    if (day >= 11 && day <= 13) return 'th'
-
-    switch (day % 10) {
-        case 1:
-            return 'st'
-        case 2:
-            return 'nd'
-        case 3:
-            return 'rd'
-        default:
-            return 'th'
-    }
+    const result = `${weekday}, ${day}.${month}.${year}`
+    console.error(`[DEBUG] formatJournalDate(${date.toISOString()}) = ${result}`)
+    return result
 }
 
 // Helper function to make API calls to Logseq
 async function callLogseqApi(method: string, args: any[] = []): Promise<any> {
+    console.error(`[DEBUG] Calling ${method} with args:`, JSON.stringify(args))
     const response = await fetch(LOGSEQ_API_URL, {
         method: 'POST',
         headers: {
@@ -59,12 +54,15 @@ async function callLogseqApi(method: string, args: any[] = []): Promise<any> {
     })
 
     if (!response.ok) {
+        console.error(`[DEBUG] API error: ${response.status} ${response.statusText}`)
         throw new Error(
             `Logseq API error: ${response.status} ${response.statusText}`
         )
     }
 
-    return response.json()
+    const result = await response.json()
+    console.error(`[DEBUG] API response type:`, Array.isArray(result) ? 'array' : typeof result)
+    return result
 }
 
 // Helper function to add content to a page by creating blocks
@@ -112,10 +110,10 @@ async function addContentToPage(
 
 // Check if a string represents a journal page date
 function isJournalDate(pageName: string): boolean {
-    // Journal pages typically have formats like "Mar 14th, 2025"
-    // This regex matches common journal date formats
+    // Journal pages in Logseq have format: "weekday, DD.MM.YYYY" (lowercase)
+    // Example: "saturday, 14.02.2026"
     const journalDateRegex =
-        /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{1,2}(st|nd|rd|th)?,\s+\d{4}$/i
+        /^(monday|tuesday|wednesday|thursday|friday|saturday|sunday),\s+\d{2}\.\d{2}\.\d{4}$/i
     return journalDateRegex.test(pageName)
 }
 
@@ -257,8 +255,15 @@ server.tool(
     'getPage',
     {
         pageName: z.string().describe('Name of the Logseq page to retrieve'),
+        includeBacklinks: z
+            .boolean()
+            .optional()
+            .default(true)
+            .describe(
+                'Whether to include backlinks section (default: true). Set to false for journals to reduce token usage.'
+            ),
     },
-    async ({pageName}) => {
+    async ({pageName, includeBacklinks = true}) => {
         try {
             const content = await getPageContent(pageName)
 
@@ -294,15 +299,17 @@ server.tool(
 
             formattedContent += processBlocks(content)
 
-            // --- Fetch and add backlinks ---
-            const backlinks = await findBacklinks(pageName)
-            if (backlinks.length > 0) {
-                formattedContent += `\n\n## Backlinks\n\n`
-                backlinks.forEach((backlinkPageName) => {
-                    formattedContent += `- [[${backlinkPageName}]]\n`
-                })
-            } else {
-                formattedContent += '\n\n## Backlinks\n\nNo backlinks found.\n'
+            // --- Fetch and add backlinks (optional) ---
+            if (includeBacklinks) {
+                const backlinks = await findBacklinks(pageName)
+                if (backlinks.length > 0) {
+                    formattedContent += `\n\n## Backlinks\n\n`
+                    backlinks.forEach((backlinkPageName) => {
+                        formattedContent += `- [[${backlinkPageName}]]\n`
+                    })
+                } else {
+                    formattedContent += '\n\n## Backlinks\n\nNo backlinks found.\n'
+                }
             }
             // --- End backlinks ---
 
@@ -380,16 +387,28 @@ server.tool(
     },
     async ({dateRange}) => {
         try {
+            // Debug info
+            const debugInfo = `API URL: ${LOGSEQ_API_URL}, Token present: ${!!LOGSEQ_TOKEN}, Date range: ${dateRange}`
+
             // Get all pages
             const pages = await callLogseqApi('logseq.Editor.getAllPages')
 
             // Parse the date range
             const {start, end, title} = parseDateRange(dateRange)
 
+            // More debug info
+            const debugFilter = `Found ${pages.length} total pages, filtering from ${start.toISOString()} to ${end.toISOString()}`
+
             // Filter for journal pages within the date range
             const journalPages = pages.filter((page: any) => {
-                const pageDate = new Date(page.updatedAt)
-                return page['journal?'] === true && pageDate >= start && pageDate <= end
+                if (!page['journal?'] || !page.journalDay) return false
+                // journalDay is in format YYYYMMDD (e.g., 20260214)
+                const journalDayStr = String(page.journalDay)
+                const year = parseInt(journalDayStr.substring(0, 4))
+                const month = parseInt(journalDayStr.substring(4, 6)) - 1 // Month is 0-indexed
+                const day = parseInt(journalDayStr.substring(6, 8))
+                const pageDate = new Date(year, month, day)
+                return pageDate >= start && pageDate <= end
             })
 
             // Sort by date
@@ -498,7 +517,7 @@ server.tool(
                 content: [
                     {
                         type: 'text',
-                        text: `Error generating journal summary: ${error.message}`,
+                        text: `Error generating journal summary: ${error.message}\n\nDebug: API=${LOGSEQ_API_URL}, TokenSet=${!!LOGSEQ_TOKEN}, Range=${dateRange}\n\nStack: ${error.stack}`,
                     },
                 ],
             }
